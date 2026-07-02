@@ -1,7 +1,7 @@
 use std::{
     fmt::Debug,
     fs::File,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::LazyLock,
 };
@@ -499,15 +499,28 @@ impl Png {
         }
     }
 
-    /// Unpacks `width` single-channel samples (grayscale intensities or
-    /// palette indices) from one scanline's worth of bytes, per `bit_depth`.
-    /// Rows are byte-aligned, so for bit depths < 8 the last byte of a row
-    /// may hold unused padding bits that must be dropped rather than read as
-    /// extra samples.
-    fn unpack_samples(row: &[u8], bit_depth: BitDepth, width: usize) -> Vec<u8> {
+    /// Number of channels/samples per pixel for this image's color type.
+    /// IndexedColor counts as 3 because `pixels` resolves each index through
+    /// the palette into an RGB triple.
+    fn channels(&self) -> usize {
+        match self.header.color_type {
+            ColorType::Grayscale => 1,
+            ColorType::GrayScaleAlpha => 2,
+            ColorType::TrueColor | ColorType::IndexedColor => 3,
+            ColorType::TrueColorAlpha => 4,
+        }
+    }
+
+    /// Unpacks `width` pixels' worth of channel samples (`channels` per
+    /// pixel) from one scanline's bytes, per `bit_depth`, widening every
+    /// sample to `u16`. Bit depths below 8 only ever occur with a single
+    /// channel (Grayscale, IndexedColor). Rows are byte-aligned, so for bit
+    /// depths < 8 the last byte of a row may hold unused padding bits that
+    /// must be dropped rather than read as extra samples.
+    fn unpack_channels(row: &[u8], bit_depth: BitDepth, channels: usize, width: usize) -> Vec<u16> {
         match bit_depth {
-            BitDepth::B8 => row[..width].to_vec(),
             BitDepth::B1 | BitDepth::B2 | BitDepth::B4 => {
+                assert!(channels == 1, "sub-byte bit depths only support 1 channel");
                 let bits = match bit_depth {
                     BitDepth::B1 => 1,
                     BitDepth::B2 => 2,
@@ -517,19 +530,56 @@ impl Png {
                 let samples_per_byte = 8 / bits;
                 row.iter()
                     .flat_map(|&byte| {
-                        (0..samples_per_byte)
-                            .map(move |i| (byte >> (8 - bits * (i + 1))) & ((1 << bits) - 1))
+                        (0..samples_per_byte).map(move |i| {
+                            ((byte >> (8 - bits * (i + 1))) & ((1 << bits) - 1)) as u16
+                        })
                     })
                     .take(width)
                     .collect()
             }
-            BitDepth::B16 => unreachable!("16-bit samples aren't bit-packed, nothing to unpack"),
+            BitDepth::B8 => row[..width * channels].iter().map(|&b| b as u16).collect(),
+            BitDepth::B16 => row[..width * channels * 2]
+                .chunks_exact(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect(),
+        }
+    }
+
+    /// Decodes this image into a flat, row-major array of pixel samples,
+    /// `channels()` values per pixel, all widened to `u16` regardless of the
+    /// source bit depth. IndexedColor samples are resolved through the
+    /// palette into RGB triples rather than left as raw indices.
+    fn pixels(&self) -> Vec<u16> {
+        let width = self.header.width as usize;
+        let stride = Self::scanline_length(&self.header) - 1;
+        let bit_depth = self.header.bit_depth;
+
+        if let ColorType::IndexedColor = self.header.color_type {
+            let palette = &self
+                .palette
+                .as_ref()
+                .expect("IndexedColor image must have a PLTE chunk")
+                .palettes;
+            self.data
+                .chunks_exact(stride)
+                .flat_map(|row| Self::unpack_channels(row, bit_depth, 1, width))
+                .flat_map(|index| {
+                    let Palette { r, g, b } = palette[index as usize];
+                    [r as u16, g as u16, b as u16]
+                })
+                .collect()
+        } else {
+            let channels = self.channels();
+            self.data
+                .chunks_exact(stride)
+                .flat_map(|row| Self::unpack_channels(row, bit_depth, channels, width))
+                .collect()
         }
     }
 
     /// Maximum sample value representable at `bit_depth` (i.e. `2^bits - 1`),
-    /// used as the PPM/PGM header's maxval for grayscale and true-color images.
-    fn max_sample_value(bit_depth: BitDepth) -> u32 {
+    /// used as the PAM header's MAXVAL.
+    fn max_sample_value(bit_depth: BitDepth) -> u16 {
         match bit_depth {
             BitDepth::B1 => 1,
             BitDepth::B2 => 3,
@@ -554,80 +604,40 @@ impl Png {
         }
     }
 
-    fn write_to_ppm(&self, filepath: &Path) -> std::io::Result<()> {
-        let mut file = File::create(filepath)?;
-        match self.header.color_type {
-            ColorType::Grayscale => {
-                writeln!(file, "P2")?;
-                writeln!(file, "{} {}", self.header.width, self.header.height)?;
-                writeln!(file, "{}", Self::max_sample_value(self.header.bit_depth))?;
-                match self.header.bit_depth {
-                    BitDepth::B1 | BitDepth::B2 | BitDepth::B4 => {
-                        let width = self.header.width as usize;
-                        let stride = Self::scanline_length(&self.header) - 1;
-                        for row in self.data.chunks_exact(stride) {
-                            for sample in Self::unpack_samples(row, self.header.bit_depth, width) {
-                                writeln!(file, "{sample}")?;
-                            }
-                        }
-                    }
-                    BitDepth::B8 => {
-                        for byte in &self.data {
-                            writeln!(file, "{}", byte)?;
-                        }
-                    }
-                    BitDepth::B16 => {
-                        for byte in self.data.chunks_exact(2) {
-                            let v = (byte[0] as u16) << 8 | byte[1] as u16;
-                            writeln!(file, "{}", v)?;
-                        }
-                    }
-                }
-            }
-            ColorType::TrueColor => {
-                writeln!(file, "P3")?;
-                writeln!(file, "{} {}", self.header.width, self.header.height)?;
-                writeln!(file, "{}", Self::max_sample_value(self.header.bit_depth))?;
-                match self.header.bit_depth {
-                    BitDepth::B8 => {
-                        for byte in self.data.chunks_exact(3) {
-                            writeln!(file, "{} {} {}", byte[0], byte[1], byte[2])?;
-                        }
-                    }
-                    BitDepth::B16 => {
-                        for byte in self.data.chunks_exact(6) {
-                            let v1 = (byte[0] as u16) << 8 | byte[1] as u16;
-                            let v2 = (byte[2] as u16) << 8 | byte[3] as u16;
-                            let v3 = (byte[4] as u16) << 8 | byte[5] as u16;
-                            writeln!(file, "{} {} {}", v1, v2, v3)?;
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            ColorType::IndexedColor => {
-                let palette = &self
-                    .palette
-                    .as_ref()
-                    .expect("IndexedColor image must have a PLTE chunk")
-                    .palettes;
+    /// Writes this image as a binary PAM (P7, netpbm's arbitrary-depth
+    /// format). Unlike PGM/PPM, PAM's DEPTH/TUPLTYPE header fields let one
+    /// writer cover every ColorType, alpha channels included.
+    fn write_to_pam(&self, filepath: &Path) -> std::io::Result<()> {
+        let mut file = BufWriter::new(File::create(filepath)?);
+        let channels = self.channels();
+        let maxval = match self.header.color_type {
+            // Palette entries are always 8-bit RGB,wq regardless of index bit depth.
+            ColorType::IndexedColor => 255,
+            _ => Self::max_sample_value(self.header.bit_depth),
+        };
+        let tuple_type = match self.header.color_type {
+            ColorType::Grayscale => "GRAYSCALE",
+            ColorType::GrayScaleAlpha => "GRAYSCALE_ALPHA",
+            ColorType::TrueColor | ColorType::IndexedColor => "RGB",
+            ColorType::TrueColorAlpha => "RGB_ALPHA",
+        };
 
-                writeln!(file, "P3")?;
-                writeln!(file, "{} {}", self.header.width, self.header.height)?;
-                writeln!(file, "255")?;
+        writeln!(file, "P7")?;
+        writeln!(file, "WIDTH {}", self.header.width)?;
+        writeln!(file, "HEIGHT {}", self.header.height)?;
+        writeln!(file, "DEPTH {channels}")?;
+        writeln!(file, "MAXVAL {maxval}")?;
+        writeln!(file, "TUPLTYPE {tuple_type}")?;
+        writeln!(file, "ENDHDR")?;
 
-                let width = self.header.width as usize;
-                let stride = Self::scanline_length(&self.header) - 1;
-                for row in self.data.chunks_exact(stride) {
-                    for index in Self::unpack_samples(row, self.header.bit_depth, width) {
-                        let Palette { r, g, b } = palette[index as usize];
-                        writeln!(file, "{r} {g} {b}")?;
-                    }
-                }
-            }
-            ColorType::GrayScaleAlpha => todo!(),
-            ColorType::TrueColorAlpha => todo!(),
-        }
+        let samples = self.pixels();
+        let bytes: Vec<u8> = if maxval > 255 {
+            samples.iter().flat_map(|v| v.to_be_bytes()).collect()
+        } else {
+            samples.iter().map(|&v| v as u8).collect()
+        };
+        file.write_all(&bytes)?;
+
         Ok(())
     }
 }
@@ -648,12 +658,8 @@ fn main() -> std::io::Result<()> {
         dbg!(&png);
         let mut output_path = PathBuf::new();
         output_path.push("out");
-        output_path.push(format!(
-            "{}.{}",
-            line,
-            if line.contains('g') { "pgm" } else { "ppm" }
-        ));
-        png.write_to_ppm(&output_path)?;
+        output_path.push(format!("{}.pam", line));
+        png.write_to_pam(&output_path)?;
     }
 
     Ok(())
