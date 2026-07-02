@@ -807,15 +807,39 @@ impl Png {
         }
     }
 
+    /// Assumed display gamma (roughly that of a CRT) used to gamma-correct
+    /// stored samples per the file's gAMA chunk. PAM/PGM/PPM output carries
+    /// no gamma metadata of its own, so without this, images that encode the
+    /// same picture under different gAMA tags (as PngSuite's g0x* files do)
+    /// would decode to visibly different sample values.
+    const DISPLAY_GAMMA: f64 = 2.2;
+
+    /// Gamma-corrects one color sample (never alpha, which is always
+    /// linear) so that `sample^(1/(file_gamma * DISPLAY_GAMMA))` maps the
+    /// stored value to the intensity a `DISPLAY_GAMMA`-gamma display would
+    /// need to reproduce the original linear light.
+    fn gamma_correct(sample: u16, max: u16, file_gamma: f64) -> u16 {
+        let normalized = sample as f64 / max as f64;
+        let corrected = normalized.powf(1.0 / (file_gamma * Self::DISPLAY_GAMMA));
+        (corrected * max as f64).round().clamp(0.0, max as f64) as u16
+    }
+
     /// Decodes this image into a flat, row-major array of pixel samples,
     /// `channels()` values per pixel, all widened to `u16` regardless of the
     /// source bit depth. IndexedColor samples are resolved through the
     /// palette into RGB triples rather than left as raw indices. A tRNS
     /// chunk (Grayscale/TrueColor/IndexedColor only) appends a synthesized
     /// alpha sample per pixel: fully transparent (0) for the one color/index
-    /// tRNS designates as transparent, fully opaque otherwise.
+    /// tRNS designates as transparent, fully opaque otherwise. A gAMA chunk
+    /// gamma-corrects every color sample (palette entries included), leaving
+    /// alpha untouched.
     fn pixels(&self) -> Vec<u16> {
-        let opaque = Self::max_sample_value(self.header.bit_depth);
+        let max = Self::max_sample_value(self.header.bit_depth);
+        let correct = |v: u16| match self.gamma {
+            Some(file_gamma) => Self::gamma_correct(v, max, file_gamma),
+            None => v,
+        };
+
         match self.header.color_type {
             ColorType::IndexedColor => {
                 let palette = &self
@@ -823,6 +847,12 @@ impl Png {
                     .as_ref()
                     .expect("IndexedColor image must have a PLTE chunk")
                     .palettes;
+                // Palette entries are always 8-bit RGB, regardless of the
+                // index bit depth, so gamma-correct them against max=255.
+                let correct_palette = |v: u8| match self.gamma {
+                    Some(file_gamma) => Self::gamma_correct(v as u16, 255, file_gamma) as u8,
+                    None => v,
+                };
                 match &self.trns {
                     Some(TRNSChunk::Indexed(alphas)) => self
                         .samples
@@ -830,7 +860,12 @@ impl Png {
                         .flat_map(|&index| {
                             let Palette { r, g, b } = palette[index as usize];
                             let a = alphas.get(index as usize).copied().unwrap_or(255) as u16;
-                            [r as u16, g as u16, b as u16, a]
+                            [
+                                correct_palette(r) as u16,
+                                correct_palette(g) as u16,
+                                correct_palette(b) as u16,
+                                a,
+                            ]
                         })
                         .collect(),
                     _ => self
@@ -838,7 +873,11 @@ impl Png {
                         .iter()
                         .flat_map(|&index| {
                             let Palette { r, g, b } = palette[index as usize];
-                            [r as u16, g as u16, b as u16]
+                            [
+                                correct_palette(r) as u16,
+                                correct_palette(g) as u16,
+                                correct_palette(b) as u16,
+                            ]
                         })
                         .collect(),
                 }
@@ -847,9 +886,9 @@ impl Png {
                 Some(TRNSChunk::Gray(transparent)) => self
                     .samples
                     .iter()
-                    .flat_map(|&v| [v, if v == *transparent { 0 } else { opaque }])
+                    .flat_map(|&v| [correct(v), if v == *transparent { 0 } else { max }])
                     .collect(),
-                _ => self.samples.clone(),
+                _ => self.samples.iter().map(|&v| correct(v)).collect(),
             },
             ColorType::TrueColor => match &self.trns {
                 Some(TRNSChunk::TrueColor { r, g, b }) => self
@@ -859,14 +898,27 @@ impl Png {
                         let a = if px[0] == *r && px[1] == *g && px[2] == *b {
                             0
                         } else {
-                            opaque
+                            max
                         };
-                        [px[0], px[1], px[2], a]
+                        [correct(px[0]), correct(px[1]), correct(px[2]), a]
                     })
                     .collect(),
-                _ => self.samples.clone(),
+                _ => self
+                    .samples
+                    .chunks_exact(3)
+                    .flat_map(|px| [correct(px[0]), correct(px[1]), correct(px[2])])
+                    .collect(),
             },
-            ColorType::GrayScaleAlpha | ColorType::TrueColorAlpha => self.samples.clone(),
+            ColorType::GrayScaleAlpha => self
+                .samples
+                .chunks_exact(2)
+                .flat_map(|px| [correct(px[0]), px[1]])
+                .collect(),
+            ColorType::TrueColorAlpha => self
+                .samples
+                .chunks_exact(4)
+                .flat_map(|px| [correct(px[0]), correct(px[1]), correct(px[2]), px[3]])
+                .collect(),
         }
     }
 
