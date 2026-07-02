@@ -15,6 +15,7 @@ struct IHDRChunk {
     height: u32,
     bit_depth: BitDepth,
     color_type: ColorType,
+    interlace_method: InterlaceMethod,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -217,7 +218,7 @@ impl From<u8> for ColorType {
         }
     }
 }
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum InterlaceMethod {
     None,
     Adam7,
@@ -281,16 +282,12 @@ impl IHDRChunk {
             "only filter method 0 is supported, got {filter_method}"
         );
 
-        assert!(
-            matches!(interlace_method, InterlaceMethod::None),
-            "Adam7 interlacing is not yet supported"
-        );
-
         Ok(IHDRChunk {
             width,
             height,
             bit_depth,
             color_type,
+            interlace_method,
         })
     }
 }
@@ -315,7 +312,10 @@ struct Png {
     palette: Option<PLTEChunk>,
     gamma: Option<f64>,
     sbit: Option<SBITChunk>,
-    data: Vec<u8>,
+    /// Fully reconstructed (unfiltered, deinterlaced, bit-unpacked) samples in
+    /// row-major order, `raw_channels(header.color_type)` values per pixel.
+    /// For IndexedColor this holds raw palette indices, not resolved RGB.
+    samples: Vec<u16>,
 }
 
 impl Debug for Png {
@@ -393,45 +393,101 @@ impl Png {
         let n = read.read(&mut [0])?;
         assert!(n == 0, "png has data remaing after IEND chunk");
 
-        let (data, _checksum) = decompress(&data, zlib::Format::Zlib).unwrap();
-        let data = Self::unfilter(&header, data)?;
+        let (inflated, _checksum) = decompress(&data, zlib::Format::Zlib).unwrap();
+        let raw_channels = Self::raw_channels(header.color_type);
+        let samples = match header.interlace_method {
+            InterlaceMethod::None => Self::decode_pass(
+                header.bit_depth,
+                header.color_type,
+                raw_channels,
+                header.width,
+                header.height,
+                &inflated,
+            ),
+            InterlaceMethod::Adam7 => Self::decode_adam7(&header, raw_channels, &inflated),
+        };
 
         Ok(Png {
             header,
             palette,
             gamma,
             sbit,
-            data,
+            samples,
         })
     }
 
-    fn scanline_length(header: &IHDRChunk) -> usize {
-        let mut scan_line_len = match header.bit_depth {
-            BitDepth::B1 => (header.width + 7) / 8,
-            BitDepth::B2 => (header.width + 3) / 4,
-            BitDepth::B4 => (header.width + 1) / 2,
-            BitDepth::B8 => header.width,
-            BitDepth::B16 => header.width * 2,
-        };
-        scan_line_len *= match header.color_type {
+    /// Number of raw samples per pixel as they appear in the bitstream, i.e.
+    /// before IndexedColor is resolved through the palette.
+    fn raw_channels(color_type: ColorType) -> usize {
+        match color_type {
             ColorType::Grayscale => 1,
             ColorType::TrueColor => 3,
             ColorType::IndexedColor => 1,
             ColorType::GrayScaleAlpha => 2,
             ColorType::TrueColorAlpha => 4,
+        }
+    }
+
+    fn scanline_length_for(bit_depth: BitDepth, color_type: ColorType, width: u32) -> usize {
+        let mut scan_line_len = match bit_depth {
+            BitDepth::B1 => (width + 7) / 8,
+            BitDepth::B2 => (width + 3) / 4,
+            BitDepth::B4 => (width + 1) / 2,
+            BitDepth::B8 => width,
+            BitDepth::B16 => width * 2,
         };
+        scan_line_len *= Self::raw_channels(color_type) as u32;
         scan_line_len as usize + 1 //1 added for the filter byte.
     }
 
-    fn unfilter(header: &IHDRChunk, data: Vec<u8>) -> std::io::Result<Vec<u8>> {
-        let scan_line_len = Self::scanline_length(header);
+    fn get_bpp_for(bit_depth: BitDepth, color_type: ColorType) -> usize {
+        match color_type {
+            ColorType::Grayscale => match bit_depth {
+                BitDepth::B1 | BitDepth::B2 | BitDepth::B4 | BitDepth::B8 => 1,
+                BitDepth::B16 => 2,
+            },
+            ColorType::TrueColor => match bit_depth {
+                BitDepth::B8 => 3,
+                BitDepth::B16 => 6,
+                _ => unreachable!(),
+            },
+            ColorType::IndexedColor => match bit_depth {
+                // a pixel is a single palette-index sample, so bpp is always 1 byte
+                // (rounding up), regardless of how many bits that sample uses.
+                BitDepth::B1 | BitDepth::B2 | BitDepth::B4 | BitDepth::B8 => 1,
+                _ => unreachable!(),
+            },
+            ColorType::GrayScaleAlpha => match bit_depth {
+                BitDepth::B8 => 2,
+                BitDepth::B16 => 4,
+                _ => unreachable!(),
+            },
+            ColorType::TrueColorAlpha => match bit_depth {
+                BitDepth::B8 => 4,
+                BitDepth::B16 => 8,
+                _ => unreachable!(),
+            },
+        }
+    }
+
+    /// Reverses scanline filtering for a single width x height image (or, for
+    /// an interlaced PNG, a single Adam7 pass), returning the reconstructed
+    /// pixel bytes with the per-row filter-type bytes stripped out.
+    fn unfilter_pass(
+        bit_depth: BitDepth,
+        color_type: ColorType,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let scan_line_len = Self::scanline_length_for(bit_depth, color_type, width);
         let stride = scan_line_len - 1; // pixel bytes per row, filter-type byte excluded
-        let bpp = Self::get_bpp(header);
-        assert!(data.len() == scan_line_len * header.height as usize);
+        let bpp = Self::get_bpp_for(bit_depth, color_type);
+        assert!(data.len() == scan_line_len * height as usize);
 
-        let mut output = Vec::with_capacity(stride * header.height as usize);
+        let mut output = Vec::with_capacity(stride * height as usize);
 
-        for row_i in 0..header.height as usize {
+        for row_i in 0..height as usize {
             let row = &data[row_i * scan_line_len..(row_i + 1) * scan_line_len];
             let filter_type = row[0];
             let row = &row[1..];
@@ -466,37 +522,107 @@ impl Png {
             }
         }
 
-        Ok(output)
+        output
     }
 
-    fn get_bpp(header: &IHDRChunk) -> usize {
-        match header.color_type {
-            ColorType::Grayscale => match header.bit_depth {
-                BitDepth::B1 | BitDepth::B2 | BitDepth::B4 | BitDepth::B8 => 1,
-                BitDepth::B16 => 2,
-            },
-            ColorType::TrueColor => match header.bit_depth {
-                BitDepth::B8 => 3,
-                BitDepth::B16 => 6,
-                _ => unreachable!(),
-            },
-            ColorType::IndexedColor => match header.bit_depth {
-                // a pixel is a single palette-index sample, so bpp is always 1 byte
-                // (rounding up), regardless of how many bits that sample uses.
-                BitDepth::B1 | BitDepth::B2 | BitDepth::B4 | BitDepth::B8 => 1,
-                _ => unreachable!(),
-            },
-            ColorType::GrayScaleAlpha => match header.bit_depth {
-                BitDepth::B8 => 2,
-                BitDepth::B16 => 4,
-                _ => unreachable!(),
-            },
-            ColorType::TrueColorAlpha => match header.bit_depth {
-                BitDepth::B8 => 4,
-                BitDepth::B16 => 8,
-                _ => unreachable!(),
-            },
+    /// Unfilters and bit-unpacks one width x height image worth of scanline
+    /// data (the whole image for non-interlaced PNGs, or a single Adam7 pass)
+    /// into row-major `u16` samples, `channels` per pixel.
+    fn decode_pass(
+        bit_depth: BitDepth,
+        color_type: ColorType,
+        channels: usize,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> Vec<u16> {
+        let packed = Self::unfilter_pass(bit_depth, color_type, width, height, data);
+        let stride = Self::scanline_length_for(bit_depth, color_type, width) - 1;
+        packed
+            .chunks_exact(stride)
+            .flat_map(|row| Self::unpack_channels(row, bit_depth, channels, width as usize))
+            .collect()
+    }
+
+    /// (x_start, y_start, x_step, y_step) for each of the 7 Adam7 passes.
+    const ADAM7_PASSES: [(u32, u32, u32, u32); 7] = [
+        (0, 0, 8, 8),
+        (4, 0, 8, 8),
+        (0, 4, 4, 8),
+        (2, 0, 4, 4),
+        (0, 2, 2, 4),
+        (1, 0, 2, 2),
+        (0, 1, 1, 2),
+    ];
+
+    /// Width/height of the sub-image sampled by one Adam7 pass; either may be
+    /// 0 when the full image is smaller than the pass's starting offset.
+    fn adam7_pass_dimensions(
+        width: u32,
+        height: u32,
+        x_start: u32,
+        y_start: u32,
+        x_step: u32,
+        y_step: u32,
+    ) -> (u32, u32) {
+        let pass_width = width.saturating_sub(x_start).div_ceil(x_step);
+        let pass_height = height.saturating_sub(y_start).div_ceil(y_step);
+        (pass_width, pass_height)
+    }
+
+    /// Decodes an Adam7-interlaced IDAT stream: unfilters and unpacks each of
+    /// the 7 passes independently, then scatters their pixels into a
+    /// full-resolution, row-major `u16` sample buffer.
+    fn decode_adam7(header: &IHDRChunk, raw_channels: usize, inflated: &[u8]) -> Vec<u16> {
+        let width = header.width as usize;
+        let height = header.height as usize;
+        let mut samples = vec![0u16; width * height * raw_channels];
+        let mut cursor = 0usize;
+
+        for &(x_start, y_start, x_step, y_step) in &Self::ADAM7_PASSES {
+            let (pass_width, pass_height) = Self::adam7_pass_dimensions(
+                header.width,
+                header.height,
+                x_start,
+                y_start,
+                x_step,
+                y_step,
+            );
+            if pass_width == 0 || pass_height == 0 {
+                continue;
+            }
+
+            let pass_bytes = Self::scanline_length_for(header.bit_depth, header.color_type, pass_width)
+                * pass_height as usize;
+            let pass_data = &inflated[cursor..cursor + pass_bytes];
+            cursor += pass_bytes;
+
+            let pass_samples = Self::decode_pass(
+                header.bit_depth,
+                header.color_type,
+                raw_channels,
+                pass_width,
+                pass_height,
+                pass_data,
+            );
+
+            for row in 0..pass_height as usize {
+                for col in 0..pass_width as usize {
+                    let dst_x = x_start as usize + col * x_step as usize;
+                    let dst_y = y_start as usize + row * y_step as usize;
+                    let dst_idx = (dst_y * width + dst_x) * raw_channels;
+                    let src_idx = (row * pass_width as usize + col) * raw_channels;
+                    samples[dst_idx..dst_idx + raw_channels]
+                        .copy_from_slice(&pass_samples[src_idx..src_idx + raw_channels]);
+                }
+            }
         }
+
+        assert!(
+            cursor == inflated.len(),
+            "unexpected leftover Adam7 pass data"
+        );
+        samples
     }
 
     /// Number of channels/samples per pixel for this image's color type.
@@ -550,30 +676,21 @@ impl Png {
     /// source bit depth. IndexedColor samples are resolved through the
     /// palette into RGB triples rather than left as raw indices.
     fn pixels(&self) -> Vec<u16> {
-        let width = self.header.width as usize;
-        let stride = Self::scanline_length(&self.header) - 1;
-        let bit_depth = self.header.bit_depth;
-
         if let ColorType::IndexedColor = self.header.color_type {
             let palette = &self
                 .palette
                 .as_ref()
                 .expect("IndexedColor image must have a PLTE chunk")
                 .palettes;
-            self.data
-                .chunks_exact(stride)
-                .flat_map(|row| Self::unpack_channels(row, bit_depth, 1, width))
-                .flat_map(|index| {
+            self.samples
+                .iter()
+                .flat_map(|&index| {
                     let Palette { r, g, b } = palette[index as usize];
                     [r as u16, g as u16, b as u16]
                 })
                 .collect()
         } else {
-            let channels = self.channels();
-            self.data
-                .chunks_exact(stride)
-                .flat_map(|row| Self::unpack_channels(row, bit_depth, channels, width))
-                .collect()
+            self.samples.clone()
         }
     }
 
