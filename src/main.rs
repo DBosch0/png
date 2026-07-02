@@ -306,8 +306,7 @@ impl ICCPChunk {
             compression_method == 0,
             "unsupported iCCP compression method, expected 0, got {compression_method}"
         );
-        let (profile, _checksum) =
-            decompress(&buf[null_pos + 2..], zlib::Format::Zlib).unwrap();
+        let (profile, _checksum) = decompress(&buf[null_pos + 2..], zlib::Format::Zlib).unwrap();
         Ok(Self {
             profile_name,
             profile,
@@ -437,7 +436,13 @@ impl SPLTChunk {
                 )
             };
             let frequency = read_u16(&mut entry_data)?;
-            entries.push(SPLTEntry { r, g, b, a, frequency });
+            entries.push(SPLTEntry {
+                r,
+                g,
+                b,
+                a,
+                frequency,
+            });
         }
 
         Ok(Self {
@@ -567,13 +572,12 @@ impl ITXtChunk {
             .iter()
             .position(|&b| b == 0)
             .expect("iTXt chunk missing null terminator after translated keyword");
-        let translated_keyword =
-            String::from_utf8(rest[..trans_end].to_vec()).expect("iTXt translated keyword is not valid utf8");
+        let translated_keyword = String::from_utf8(rest[..trans_end].to_vec())
+            .expect("iTXt translated keyword is not valid utf8");
 
         let text_bytes = &rest[trans_end + 1..];
         let text = if compression_flag {
-            let (decompressed, _checksum) =
-                decompress(text_bytes, zlib::Format::Zlib).unwrap();
+            let (decompressed, _checksum) = decompress(text_bytes, zlib::Format::Zlib).unwrap();
             String::from_utf8(decompressed).expect("iTXt text is not valid utf8")
         } else {
             String::from_utf8(text_bytes.to_vec()).expect("iTXt text is not valid utf8")
