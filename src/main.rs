@@ -200,6 +200,409 @@ impl SBITChunk {
     }
 }
 
+/// An x,y chromaticity coordinate in the CIE 1931 color space, as used by
+/// the cHRM chunk for the white point and the red/green/blue primaries.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Chromaticity {
+    x: f64,
+    y: f64,
+}
+
+/// The chromaticities of the white point and the R/G/B primaries used to
+/// encode this image. Purely descriptive: applying it would mean mapping
+/// between these primaries and the display's (usually via a 3x3 matrix),
+/// which is out of scope here, so it's stored but not used to transform
+/// pixels the way gAMA/sRGB are.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CHRMChunk {
+    white_point: Chromaticity,
+    red: Chromaticity,
+    green: Chromaticity,
+    blue: Chromaticity,
+}
+
+impl CHRMChunk {
+    fn read_bytes<R: Read>(read: &mut R, length: usize) -> std::io::Result<Self> {
+        assert!(
+            length == 32,
+            "invalid cHRM chunk length, expected 32, got {length}"
+        );
+        fn point<R: Read>(read: &mut R) -> std::io::Result<Chromaticity> {
+            Ok(Chromaticity {
+                x: read_u32(read)? as f64 / 100000.0,
+                y: read_u32(read)? as f64 / 100000.0,
+            })
+        }
+        Ok(Self {
+            white_point: point(read)?,
+            red: point(read)?,
+            green: point(read)?,
+            blue: point(read)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RenderingIntent {
+    Perceptual,
+    RelativeColorimetric,
+    Saturation,
+    AbsoluteColorimetric,
+}
+
+impl From<u8> for RenderingIntent {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Perceptual,
+            1 => Self::RelativeColorimetric,
+            2 => Self::Saturation,
+            3 => Self::AbsoluteColorimetric,
+            _ => unreachable!("invalid sRGB rendering intent, expected 0-3, got {value}"),
+        }
+    }
+}
+
+/// Declares the image conforms to the sRGB color space with the given
+/// rendering intent. Per spec, a decoder that honors sRGB should treat it as
+/// implying gAMA=1/2.2 and ignore any gAMA/cHRM chunks also present, which
+/// `pixels()` does by preferring this over `gamma` in its correction step.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SRGBChunk {
+    rendering_intent: RenderingIntent,
+}
+
+impl SRGBChunk {
+    fn read_bytes<R: Read>(read: &mut R, length: usize) -> std::io::Result<Self> {
+        assert!(
+            length == 1,
+            "invalid sRGB chunk length, expected 1, got {length}"
+        );
+        Ok(Self {
+            rendering_intent: RenderingIntent::from(read_u8(read)?),
+        })
+    }
+}
+
+/// An embedded ICC color profile. Applying it would require full ICC LUT/
+/// matrix support, which is out of scope, so the profile is decompressed and
+/// stored but never used to transform pixels.
+#[derive(Debug, Clone, PartialEq)]
+struct ICCPChunk {
+    profile_name: String,
+    profile: Vec<u8>,
+}
+
+impl ICCPChunk {
+    fn read_bytes<R: Read>(read: &mut R, length: usize) -> std::io::Result<Self> {
+        let mut buf = vec![0u8; length];
+        read.read_exact(&mut buf)?;
+        let null_pos = buf
+            .iter()
+            .position(|&b| b == 0)
+            .expect("iCCP chunk missing null terminator after profile name");
+        let profile_name = latin1_to_string(&buf[..null_pos]);
+        let compression_method = buf[null_pos + 1];
+        assert!(
+            compression_method == 0,
+            "unsupported iCCP compression method, expected 0, got {compression_method}"
+        );
+        let (profile, _checksum) =
+            decompress(&buf[null_pos + 2..], zlib::Format::Zlib).unwrap();
+        Ok(Self {
+            profile_name,
+            profile,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PHYSUnit {
+    Unknown,
+    Meter,
+}
+
+impl From<u8> for PHYSUnit {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Unknown,
+            1 => Self::Meter,
+            _ => unreachable!("invalid pHYs unit specifier, expected 0 or 1, got {value}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PHYSChunk {
+    pixels_per_unit_x: u32,
+    pixels_per_unit_y: u32,
+    unit: PHYSUnit,
+}
+
+impl PHYSChunk {
+    fn read_bytes<R: Read>(read: &mut R, length: usize) -> std::io::Result<Self> {
+        assert!(
+            length == 9,
+            "invalid pHYs chunk length, expected 9, got {length}"
+        );
+        Ok(Self {
+            pixels_per_unit_x: read_u32(read)?,
+            pixels_per_unit_y: read_u32(read)?,
+            unit: PHYSUnit::from(read_u8(read)?),
+        })
+    }
+}
+
+/// One relative-frequency entry per PLTE palette entry.
+#[derive(Debug, Clone, PartialEq)]
+struct HISTChunk {
+    frequencies: Vec<u16>,
+}
+
+impl HISTChunk {
+    fn read_bytes<R: Read>(
+        read: &mut R,
+        length: usize,
+        palette_len: usize,
+    ) -> std::io::Result<Self> {
+        assert!(
+            length == palette_len * 2,
+            "invalid hIST chunk length, expected {} (2 bytes per palette entry), got {length}",
+            palette_len * 2
+        );
+        let mut frequencies = Vec::with_capacity(palette_len);
+        for _ in 0..palette_len {
+            frequencies.push(read_u16(read)?);
+        }
+        Ok(Self { frequencies })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SPLTEntry {
+    r: u16,
+    g: u16,
+    b: u16,
+    a: u16,
+    frequency: u16,
+}
+
+/// A suggested reduced-color palette a decoder could quantize to on a
+/// limited-color display; multiple may appear (with different `name`s), so
+/// `Png` keeps a `Vec<SPLTChunk>` rather than an `Option`.
+#[derive(Debug, Clone, PartialEq)]
+struct SPLTChunk {
+    name: String,
+    sample_depth: u8,
+    entries: Vec<SPLTEntry>,
+}
+
+impl SPLTChunk {
+    fn read_bytes<R: Read>(read: &mut R, length: usize) -> std::io::Result<Self> {
+        let mut buf = vec![0u8; length];
+        read.read_exact(&mut buf)?;
+        let null_pos = buf
+            .iter()
+            .position(|&b| b == 0)
+            .expect("sPLT chunk missing null terminator after palette name");
+        let name = latin1_to_string(&buf[..null_pos]);
+        let sample_depth = buf[null_pos + 1];
+        assert!(
+            matches!(sample_depth, 8 | 16),
+            "invalid sPLT sample depth, expected 8 or 16, got {sample_depth}"
+        );
+
+        let mut entry_data = &buf[null_pos + 2..];
+        let entry_size = if sample_depth == 16 { 10 } else { 6 };
+        assert!(
+            entry_data.len() % entry_size == 0,
+            "sPLT entry data length {} is not a multiple of the entry size {entry_size}",
+            entry_data.len()
+        );
+
+        let mut entries = Vec::with_capacity(entry_data.len() / entry_size);
+        while !entry_data.is_empty() {
+            let (r, g, b, a) = if sample_depth == 16 {
+                (
+                    read_u16(&mut entry_data)?,
+                    read_u16(&mut entry_data)?,
+                    read_u16(&mut entry_data)?,
+                    read_u16(&mut entry_data)?,
+                )
+            } else {
+                (
+                    read_u8(&mut entry_data)? as u16,
+                    read_u8(&mut entry_data)? as u16,
+                    read_u8(&mut entry_data)? as u16,
+                    read_u8(&mut entry_data)? as u16,
+                )
+            };
+            let frequency = read_u16(&mut entry_data)?;
+            entries.push(SPLTEntry { r, g, b, a, frequency });
+        }
+
+        Ok(Self {
+            name,
+            sample_depth,
+            entries,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TIMEChunk {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+}
+
+impl TIMEChunk {
+    fn read_bytes<R: Read>(read: &mut R, length: usize) -> std::io::Result<Self> {
+        assert!(
+            length == 7,
+            "invalid tIME chunk length, expected 7, got {length}"
+        );
+        Ok(Self {
+            year: read_u16(read)?,
+            month: read_u8(read)?,
+            day: read_u8(read)?,
+            hour: read_u8(read)?,
+            minute: read_u8(read)?,
+            second: read_u8(read)?,
+        })
+    }
+}
+
+/// Decodes bytes as Latin-1 (ISO-8859-1), the encoding tEXt/zTXt keywords
+/// and text use. Latin-1's byte values map 1:1 onto Unicode code points
+/// U+0000-U+00FF, so this can never fail the way UTF-8 decoding could.
+fn latin1_to_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
+}
+
+/// Uncompressed Latin-1 text, keyed by `keyword` (e.g. "Title", "Author").
+#[derive(Debug, Clone, PartialEq)]
+struct TEXtChunk {
+    keyword: String,
+    text: String,
+}
+
+impl TEXtChunk {
+    fn from_bytes(data: &[u8]) -> Self {
+        let null_pos = data
+            .iter()
+            .position(|&b| b == 0)
+            .expect("tEXt chunk missing null terminator after keyword");
+        Self {
+            keyword: latin1_to_string(&data[..null_pos]),
+            text: latin1_to_string(&data[null_pos + 1..]),
+        }
+    }
+}
+
+/// Like `TEXtChunk`, but the text is stored zlib-compressed.
+#[derive(Debug, Clone, PartialEq)]
+struct ZTXtChunk {
+    keyword: String,
+    text: String,
+}
+
+impl ZTXtChunk {
+    fn from_bytes(data: &[u8]) -> Self {
+        let null_pos = data
+            .iter()
+            .position(|&b| b == 0)
+            .expect("zTXt chunk missing null terminator after keyword");
+        let keyword = latin1_to_string(&data[..null_pos]);
+        let compression_method = data[null_pos + 1];
+        assert!(
+            compression_method == 0,
+            "unsupported zTXt compression method, expected 0, got {compression_method}"
+        );
+        let (decompressed, _checksum) =
+            decompress(&data[null_pos + 2..], zlib::Format::Zlib).unwrap();
+        Self {
+            keyword,
+            text: latin1_to_string(&decompressed),
+        }
+    }
+}
+
+/// UTF-8 text with an optional translated keyword/language tag, optionally
+/// zlib-compressed (unlike tEXt/zTXt, which are always Latin-1).
+#[derive(Debug, Clone, PartialEq)]
+struct ITXtChunk {
+    keyword: String,
+    language_tag: String,
+    translated_keyword: String,
+    text: String,
+}
+
+impl ITXtChunk {
+    fn from_bytes(data: &[u8]) -> Self {
+        let kw_end = data
+            .iter()
+            .position(|&b| b == 0)
+            .expect("iTXt chunk missing null terminator after keyword");
+        let keyword = latin1_to_string(&data[..kw_end]);
+
+        let compression_flag = data[kw_end + 1] != 0;
+        let compression_method = data[kw_end + 2];
+        assert!(
+            !compression_flag || compression_method == 0,
+            "unsupported iTXt compression method, expected 0, got {compression_method}"
+        );
+
+        let rest = &data[kw_end + 3..];
+        let lang_end = rest
+            .iter()
+            .position(|&b| b == 0)
+            .expect("iTXt chunk missing null terminator after language tag");
+        let language_tag = latin1_to_string(&rest[..lang_end]);
+
+        let rest = &rest[lang_end + 1..];
+        let trans_end = rest
+            .iter()
+            .position(|&b| b == 0)
+            .expect("iTXt chunk missing null terminator after translated keyword");
+        let translated_keyword =
+            String::from_utf8(rest[..trans_end].to_vec()).expect("iTXt translated keyword is not valid utf8");
+
+        let text_bytes = &rest[trans_end + 1..];
+        let text = if compression_flag {
+            let (decompressed, _checksum) =
+                decompress(text_bytes, zlib::Format::Zlib).unwrap();
+            String::from_utf8(decompressed).expect("iTXt text is not valid utf8")
+        } else {
+            String::from_utf8(text_bytes.to_vec()).expect("iTXt text is not valid utf8")
+        };
+
+        Self {
+            keyword,
+            language_tag,
+            translated_keyword,
+            text,
+        }
+    }
+}
+
+/// Raw Exif metadata (TIFF-format IFD data). Parsing the IFD structure
+/// itself is a separate spec, so it's kept as opaque bytes.
+#[derive(Debug, Clone, PartialEq)]
+struct EXIFChunk {
+    data: Vec<u8>,
+}
+
+impl EXIFChunk {
+    fn from_bytes(data: &[u8]) -> Self {
+        Self {
+            data: data.to_vec(),
+        }
+    }
+}
+
 static CRC_TABLE: LazyLock<[u32; 256]> = LazyLock::new(|| {
     let mut table = [0; 256];
     for n in 0..256 {
@@ -417,6 +820,17 @@ struct Png {
     sbit: Option<SBITChunk>,
     bkgd: Option<BKGDChunk>,
     trns: Option<TRNSChunk>,
+    chrm: Option<CHRMChunk>,
+    srgb: Option<SRGBChunk>,
+    iccp: Option<ICCPChunk>,
+    phys: Option<PHYSChunk>,
+    hist: Option<HISTChunk>,
+    splt: Vec<SPLTChunk>,
+    time: Option<TIMEChunk>,
+    text: Vec<TEXtChunk>,
+    ztxt: Vec<ZTXtChunk>,
+    itxt: Vec<ITXtChunk>,
+    exif: Option<EXIFChunk>,
     /// Fully reconstructed (unfiltered, deinterlaced, bit-unpacked) samples in
     /// row-major order, `raw_channels(header.color_type)` values per pixel.
     /// For IndexedColor this holds raw palette indices, not resolved RGB.
@@ -432,6 +846,17 @@ impl Debug for Png {
             .field("sbit", &self.sbit)
             .field("bkgd", &self.bkgd)
             .field("trns", &self.trns)
+            .field("chrm", &self.chrm)
+            .field("srgb", &self.srgb)
+            .field("iccp", &self.iccp)
+            .field("phys", &self.phys)
+            .field("hist", &self.hist)
+            .field("splt", &self.splt)
+            .field("time", &self.time)
+            .field("text", &self.text)
+            .field("ztxt", &self.ztxt)
+            .field("itxt", &self.itxt)
+            .field("exif", &self.exif)
             .finish()
     }
 }
@@ -458,6 +883,17 @@ impl Png {
         let mut sbit: Option<SBITChunk> = None;
         let mut bkgd: Option<BKGDChunk> = None;
         let mut trns: Option<TRNSChunk> = None;
+        let mut chrm: Option<CHRMChunk> = None;
+        let mut srgb: Option<SRGBChunk> = None;
+        let mut iccp: Option<ICCPChunk> = None;
+        let mut phys: Option<PHYSChunk> = None;
+        let mut hist: Option<HISTChunk> = None;
+        let mut splt: Vec<SPLTChunk> = Vec::new();
+        let mut time: Option<TIMEChunk> = None;
+        let mut text: Vec<TEXtChunk> = Vec::new();
+        let mut ztxt: Vec<ZTXtChunk> = Vec::new();
+        let mut itxt: Vec<ITXtChunk> = Vec::new();
+        let mut exif: Option<EXIFChunk> = None;
 
         loop {
             let (chunk_type, chunk_data) = read_chunk(read)?;
@@ -500,6 +936,67 @@ impl Png {
                         header.color_type,
                     )?)
                 }
+                b"cHRM" => {
+                    assert!(palette.is_none(), "cHRM chunk must precede PLTE data");
+                    assert!(data.is_empty(), "cHRM chunk must precede IDAT data");
+                    chrm = Some(CHRMChunk::read_bytes(
+                        &mut chunk_data.as_slice(),
+                        chunk_data.len(),
+                    )?);
+                }
+                b"sRGB" => {
+                    assert!(palette.is_none(), "sRGB chunk must precede PLTE data");
+                    assert!(data.is_empty(), "sRGB chunk must precede IDAT data");
+                    srgb = Some(SRGBChunk::read_bytes(
+                        &mut chunk_data.as_slice(),
+                        chunk_data.len(),
+                    )?);
+                }
+                b"iCCP" => {
+                    assert!(palette.is_none(), "iCCP chunk must precede PLTE data");
+                    assert!(data.is_empty(), "iCCP chunk must precede IDAT data");
+                    iccp = Some(ICCPChunk::read_bytes(
+                        &mut chunk_data.as_slice(),
+                        chunk_data.len(),
+                    )?);
+                }
+                b"pHYs" => {
+                    assert!(data.is_empty(), "pHYs chunk must precede IDAT data");
+                    phys = Some(PHYSChunk::read_bytes(
+                        &mut chunk_data.as_slice(),
+                        chunk_data.len(),
+                    )?);
+                }
+                b"hIST" => {
+                    let palette_len = palette
+                        .as_ref()
+                        .expect("PLTE chunk must precede hIST chunk")
+                        .palettes
+                        .len();
+                    assert!(data.is_empty(), "hIST chunk must precede IDAT data");
+                    hist = Some(HISTChunk::read_bytes(
+                        &mut chunk_data.as_slice(),
+                        chunk_data.len(),
+                        palette_len,
+                    )?);
+                }
+                b"sPLT" => {
+                    assert!(data.is_empty(), "sPLT chunk must precede IDAT data");
+                    splt.push(SPLTChunk::read_bytes(
+                        &mut chunk_data.as_slice(),
+                        chunk_data.len(),
+                    )?);
+                }
+                b"tIME" => {
+                    time = Some(TIMEChunk::read_bytes(
+                        &mut chunk_data.as_slice(),
+                        chunk_data.len(),
+                    )?);
+                }
+                b"tEXt" => text.push(TEXtChunk::from_bytes(&chunk_data)),
+                b"zTXt" => ztxt.push(ZTXtChunk::from_bytes(&chunk_data)),
+                b"iTXt" => itxt.push(ITXtChunk::from_bytes(&chunk_data)),
+                b"eXIf" => exif = Some(EXIFChunk::from_bytes(&chunk_data)),
                 b"PLTE" => {
                     if palette.is_none() {
                         palette = Some(PLTEChunk::from_bytes(
@@ -545,6 +1042,17 @@ impl Png {
             sbit,
             bkgd,
             trns,
+            chrm,
+            srgb,
+            iccp,
+            phys,
+            hist,
+            splt,
+            time,
+            text,
+            ztxt,
+            itxt,
+            exif,
             samples,
         })
     }
@@ -824,18 +1332,29 @@ impl Png {
         (corrected * max as f64).round().clamp(0.0, max as f64) as u16
     }
 
+    /// The file gamma to correct against. Per spec, an sRGB chunk implies
+    /// gAMA=1/2.2 and takes precedence over any gAMA chunk also present.
+    fn effective_gamma(&self) -> Option<f64> {
+        if self.srgb.is_some() {
+            Some(1.0 / Self::DISPLAY_GAMMA)
+        } else {
+            self.gamma
+        }
+    }
+
     /// Decodes this image into a flat, row-major array of pixel samples,
     /// `channels()` values per pixel, all widened to `u16` regardless of the
     /// source bit depth. IndexedColor samples are resolved through the
     /// palette into RGB triples rather than left as raw indices. A tRNS
     /// chunk (Grayscale/TrueColor/IndexedColor only) appends a synthesized
     /// alpha sample per pixel: fully transparent (0) for the one color/index
-    /// tRNS designates as transparent, fully opaque otherwise. A gAMA chunk
-    /// gamma-corrects every color sample (palette entries included), leaving
-    /// alpha untouched.
+    /// tRNS designates as transparent, fully opaque otherwise. A gAMA/sRGB
+    /// chunk gamma-corrects every color sample (palette entries included),
+    /// leaving alpha untouched.
     fn pixels(&self) -> Vec<u16> {
         let max = Self::max_sample_value(self.header.bit_depth);
-        let correct = |v: u16| match self.gamma {
+        let gamma = self.effective_gamma();
+        let correct = |v: u16| match gamma {
             Some(file_gamma) => Self::gamma_correct(v, max, file_gamma),
             None => v,
         };
@@ -849,7 +1368,7 @@ impl Png {
                     .palettes;
                 // Palette entries are always 8-bit RGB, regardless of the
                 // index bit depth, so gamma-correct them against max=255.
-                let correct_palette = |v: u8| match self.gamma {
+                let correct_palette = |v: u8| match gamma {
                     Some(file_gamma) => Self::gamma_correct(v as u16, 255, file_gamma) as u8,
                     None => v,
                 };
