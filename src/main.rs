@@ -31,6 +31,52 @@ struct PLTEChunk {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+enum BKGDChunk {
+    PalleteIndex(u8),
+    Gray(u16),
+    Color { r: u16, g: u16, b: u16 },
+}
+
+impl BKGDChunk {
+    fn read_bytes<R: Read>(
+        read: &mut R,
+        length: usize,
+        color_type: ColorType,
+    ) -> std::io::Result<Self> {
+        match color_type {
+            ColorType::IndexedColor => {
+                assert!(
+                    length == 1,
+                    "invalid bKGD length for color_type {:?}",
+                    color_type
+                );
+                Ok(Self::PalleteIndex(read_u8(read)?))
+            }
+            ColorType::Grayscale | ColorType::GrayScaleAlpha => {
+                assert!(
+                    length == 2,
+                    "invalid bKGD length for color_type {:?}",
+                    color_type
+                );
+                Ok(Self::Gray(read_u16(read)?))
+            }
+            ColorType::TrueColor | ColorType::TrueColorAlpha => {
+                assert!(
+                    length == 6,
+                    "invalid bKGD length for color_type {:?}",
+                    color_type
+                );
+                Ok(Self::Color {
+                    r: read_u16(read)?,
+                    g: read_u16(read)?,
+                    b: read_u16(read)?,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum SBITChunk {
     GrayScale(u8),
     TrueColor([u8; 3]),
@@ -140,6 +186,12 @@ fn read_u8<R: Read>(read: &mut R) -> std::io::Result<u8> {
     let mut out = [0; 1];
     read.read_exact(&mut out)?;
     Ok(u8::from_be_bytes(out))
+}
+
+fn read_u16<R: Read>(read: &mut R) -> std::io::Result<u16> {
+    let mut out = [0; 2];
+    read.read_exact(&mut out)?;
+    Ok(u16::from_be_bytes(out))
 }
 
 fn read_chunk_type<R: Read>(read: &mut R) -> std::io::Result<[u8; 4]> {
@@ -312,6 +364,7 @@ struct Png {
     palette: Option<PLTEChunk>,
     gamma: Option<f64>,
     sbit: Option<SBITChunk>,
+    bkgd: Option<BKGDChunk>,
     /// Fully reconstructed (unfiltered, deinterlaced, bit-unpacked) samples in
     /// row-major order, `raw_channels(header.color_type)` values per pixel.
     /// For IndexedColor this holds raw palette indices, not resolved RGB.
@@ -325,6 +378,7 @@ impl Debug for Png {
             .field("palette", &self.palette)
             .field("gamma", &self.gamma)
             .field("sbit", &self.sbit)
+            .field("bkgd", &self.bkgd)
             .finish()
     }
 }
@@ -349,6 +403,7 @@ impl Png {
         let mut data: Vec<u8> = Vec::new();
         let mut gamma: Option<f64> = None;
         let mut sbit: Option<SBITChunk> = None;
+        let mut bkgd: Option<BKGDChunk> = None;
 
         loop {
             let (chunk_type, chunk_data) = read_chunk(read)?;
@@ -368,6 +423,17 @@ impl Png {
                         chunk_data.len(),
                         header.color_type,
                     )?);
+                }
+                b"bKGD" => {
+                    if header.color_type == ColorType::IndexedColor {
+                        assert!(palette.is_some(), "PLTE chunk must precede bKGD chunk");
+                    }
+                    assert!(data.is_empty(), "bKGD chunk must precede IDAT data");
+                    bkgd = Some(BKGDChunk::read_bytes(
+                        &mut chunk_data.as_slice(),
+                        chunk_data.len(),
+                        header.color_type,
+                    )?)
                 }
                 b"PLTE" => {
                     if palette.is_none() {
@@ -412,6 +478,7 @@ impl Png {
             palette,
             gamma,
             sbit,
+            bkgd,
             samples,
         })
     }
@@ -592,8 +659,9 @@ impl Png {
                 continue;
             }
 
-            let pass_bytes = Self::scanline_length_for(header.bit_depth, header.color_type, pass_width)
-                * pass_height as usize;
+            let pass_bytes =
+                Self::scanline_length_for(header.bit_depth, header.color_type, pass_width)
+                    * pass_height as usize;
             let pass_data = &inflated[cursor..cursor + pass_bytes];
             cursor += pass_bytes;
 
