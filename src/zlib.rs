@@ -1,8 +1,29 @@
+// zlib decoder taken from https://github.com/dfrg/yazi
+//
+// Copyright (c) 2020 Chad Brokaw
+
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
 use std::io::{self, Write};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Format {
-    // Raw,
     Zlib,
 }
 
@@ -44,10 +65,6 @@ impl<S: Sink> DecoderStream<'_, S> {
         self.ctx.inflate(buf, &mut self.sink, false)
     }
 
-    // pub fn decompressed_size(&self) -> u64 {
-    //     self.sink.written()
-    // }
-
     pub fn finish(&mut self) -> Result<(u64, Option<u32>), Error> {
         if self.finished {
             return Err(Error::Finished);
@@ -73,11 +90,7 @@ impl<S: Sink> Write for DecoderStream<'_, S> {
             Ok(_) => Ok(buf.len()),
             Err(err) => match err {
                 Error::Io(err) => Err(err),
-                Error::Underflow 
-                // | Error::Overflow 
-                => {
-                    Err(io::Error::from(io::ErrorKind::InvalidInput))
-                }
+                Error::Underflow => Err(io::Error::from(io::ErrorKind::InvalidInput)),
                 _ => Err(io::Error::from(io::ErrorKind::InvalidData)),
             },
         }
@@ -95,7 +108,7 @@ pub fn decompress(buf: &[u8], format: Format) -> Result<(Vec<u8>, Option<u32>), 
     let mut stream = decoder.stream_into_vec(&mut vec);
     stream.write(buf)?;
     let (_, checksum) = stream.finish()?;
-    drop(stream); //TODO: maybe remove
+    drop(stream);
     Ok((vec, checksum))
 }
 
@@ -865,7 +878,6 @@ pub trait Sink {
 pub enum Error {
     Underflow,
     InvalidBitStream,
-    // Overflow,
     Finished,
     Io(std::io::Error),
 }
