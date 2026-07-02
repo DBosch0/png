@@ -3,12 +3,10 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::exit,
     sync::LazyLock,
 };
 
 use crate::zlib::decompress;
-
 mod zlib;
 
 #[derive(Debug)]
@@ -17,8 +15,6 @@ struct IHDRChunk {
     height: u32,
     bit_depth: BitDepth,
     color_type: ColorType,
-    filter_method: FilterMethod,
-    interlace_method: InterlaceMethod,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -156,6 +152,28 @@ fn read_chunk_type<R: Read>(read: &mut R) -> std::io::Result<[u8; 4]> {
     Ok(chunk_type)
 }
 
+/// Reads one PNG chunk: a 4-byte length, its 4-byte type, that many bytes of
+/// chunk data, and the trailing CRC-32, which is verified against the type
+/// and data before the chunk is handed back.
+fn read_chunk<R: Read>(read: &mut R) -> std::io::Result<([u8; 4], Vec<u8>)> {
+    let length = read_u32(read)?;
+    let chunk_type = read_chunk_type(read)?;
+    let mut chunk_data = vec![0u8; length as usize];
+    read.read_exact(&mut chunk_data)?;
+    let crc = read_u32(read)?;
+
+    let mut crc_input = Vec::with_capacity(4 + chunk_data.len());
+    crc_input.extend_from_slice(&chunk_type);
+    crc_input.extend_from_slice(&chunk_data);
+    assert!(
+        compute_crc(&crc_input) == crc,
+        "CRC mismatch in {:?} chunk",
+        str::from_utf8(&chunk_type).unwrap_or("<invalid utf8>")
+    );
+
+    Ok((chunk_type, chunk_data))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum BitDepth {
     B1,
@@ -199,28 +217,6 @@ impl From<u8> for ColorType {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum FilterMethod {
-    None,
-    Sub,
-    Up,
-    Average,
-    Paeth,
-}
-
-impl From<u8> for FilterMethod {
-    fn from(value: u8) -> Self {
-        match value {
-            0 => Self::None,
-            1 => Self::Sub,
-            2 => Self::Up,
-            3 => Self::Average,
-            4 => Self::Paeth,
-            _ => unreachable!("invalid filtering method, expected 0, 1, 2, 3, 4, got {value}"),
-        }
-    }
-}
-
 #[derive(Debug)]
 enum InterlaceMethod {
     None,
@@ -243,7 +239,7 @@ impl IHDRChunk {
         let bit_depth = BitDepth::from(read_u8(read)?);
         let color_type = ColorType::from(read_u8(read)?);
         let compression_method = read_u8(read)?;
-        let filter_method = FilterMethod::from(read_u8(read)?);
+        let filter_method = read_u8(read)?;
         let interlace_method = InterlaceMethod::from(read_u8(read)?);
 
         assert!(width <= i32::MAX as u32, "width too large");
@@ -280,13 +276,21 @@ impl IHDRChunk {
             "unsupported compression mode, expected 0, got {compression_method}"
         );
 
+        assert!(
+            filter_method == 0,
+            "only filter method 0 is supported, got {filter_method}"
+        );
+
+        assert!(
+            matches!(interlace_method, InterlaceMethod::None),
+            "Adam7 interlacing is not yet supported"
+        );
+
         Ok(IHDRChunk {
             width,
             height,
             bit_depth,
             color_type,
-            filter_method,
-            interlace_method,
         })
     }
 }
@@ -336,12 +340,9 @@ impl Png {
 
         //header chunk
         let header = {
-            _ = read_u32(read)?; //length of IHDR block
-            let chunk_type = read_chunk_type(read)?;
+            let (chunk_type, chunk_data) = read_chunk(read)?;
             assert!(&chunk_type == b"IHDR", "png must start with header");
-            let header = IHDRChunk::from_bytes(read)?;
-            _ = read_u32(read)?; //crc
-            header
+            IHDRChunk::from_bytes(&mut chunk_data.as_slice())?
         };
 
         let mut palette: Option<PLTEChunk> = None;
@@ -350,62 +351,50 @@ impl Png {
         let mut sbit: Option<SBITChunk> = None;
 
         loop {
-            let length = read_u32(read)?;
-            let chunk_type = read_chunk_type(read)?;
+            let (chunk_type, chunk_data) = read_chunk(read)?;
             match &chunk_type {
                 b"IHDR" => unreachable!("png can only have 1 header chunk"),
                 b"gAMA" => {
                     assert!(palette.is_none(), "gAMA chunk must precede PLTE data");
                     assert!(data.is_empty(), "gAMA chunk must precede IDAT data");
-                    let gamma_u32 = read_u32(read)?;
+                    let gamma_u32 = read_u32(&mut chunk_data.as_slice())?;
                     gamma = Some(gamma_u32 as f64 / 100000.0);
                 }
                 b"sBIT" => {
-                    assert!(palette.is_none(), "gAMA chunk must precede PLTE data");
-                    assert!(data.is_empty(), "gAMA chunk must precede IDAT data");
+                    assert!(palette.is_none(), "sBIT chunk must precede PLTE data");
+                    assert!(data.is_empty(), "sBIT chunk must precede IDAT data");
                     sbit = Some(SBITChunk::read_bytes(
-                        read,
-                        length as usize,
+                        &mut chunk_data.as_slice(),
+                        chunk_data.len(),
                         header.color_type,
                     )?);
                 }
                 b"PLTE" => {
                     if palette.is_none() {
-                        palette = Some(PLTEChunk::from_bytes(read, length as usize)?)
+                        palette = Some(PLTEChunk::from_bytes(
+                            &mut chunk_data.as_slice(),
+                            chunk_data.len(),
+                        )?)
                     } else {
                         unreachable!("png can only have 1 palette chunk");
                     }
                 }
                 b"IDAT" => {
-                    let mut data_block = vec![0; length as usize];
-                    read.read_exact(&mut data_block)?;
-                    data.extend(&data_block);
+                    data.extend(chunk_data);
                 }
-                b"IEND" => {
-                    _ = read_u32(read)?; //crc         
-                    break;
-                }
+                b"IEND" => break,
                 x => unimplemented!(
                     "unimplemented chunk type, {}",
                     str::from_utf8(x).expect("valid ascii string")
                 ),
             }
-
-            _ = read_u32(read)?; //crc 
         }
 
         let n = read.read(&mut [0])?;
         assert!(n == 0, "png has data remaing after IEND chunk");
 
-        dbg!(&data.len());
-        let mut decoder = flate2::write::ZlibDecoder::new(Vec::new());
-        decoder.write_all(&data).unwrap();
-        let data = decoder.finish().unwrap();
-
-        // let (data, _checksum) = decompress(&data, zlib::Format::Zlib).unwrap();
-        dbg!(&data.len());
+        let (data, _checksum) = decompress(&data, zlib::Format::Zlib).unwrap();
         let data = Self::unfilter(&header, data)?;
-        dbg!(data.len());
 
         Ok(Png {
             header,
@@ -427,38 +416,142 @@ impl Png {
         scan_line_len *= match header.color_type {
             ColorType::Grayscale => 1,
             ColorType::TrueColor => 3,
-            ColorType::IndexedColor => 3,
+            ColorType::IndexedColor => 1,
             ColorType::GrayScaleAlpha => 2,
             ColorType::TrueColorAlpha => 4,
         };
-
-        scan_line_len = match header.filter_method {
-            FilterMethod::None => scan_line_len + 1,
-            FilterMethod::Sub => todo!(),
-            FilterMethod::Up => todo!(),
-            FilterMethod::Average => todo!(),
-            FilterMethod::Paeth => todo!(),
-        };
-        scan_line_len as usize
+        scan_line_len as usize + 1 //1 added for the filter byte.
     }
 
     fn unfilter(header: &IHDRChunk, data: Vec<u8>) -> std::io::Result<Vec<u8>> {
-        let mut output = Vec::new();
         let scan_line_len = Self::scanline_length(header);
-        dbg!(scan_line_len);
-        assert!(data.len() / scan_line_len == header.height as usize);
-        match header.filter_method {
-            FilterMethod::None => {
-                for line in data.chunks(scan_line_len) {
-                    output.extend_from_slice(&line[1..]);
-                }
+        let stride = scan_line_len - 1; // pixel bytes per row, filter-type byte excluded
+        let bpp = Self::get_bpp(header);
+        assert!(data.len() == scan_line_len * header.height as usize);
+
+        let mut output = Vec::with_capacity(stride * header.height as usize);
+
+        for row_i in 0..header.height as usize {
+            let row = &data[row_i * scan_line_len..(row_i + 1) * scan_line_len];
+            let filter_type = row[0];
+            let row = &row[1..];
+
+            for i in 0..row.len() {
+                // a = left, b = up, c = upper-left, all already-reconstructed bytes.
+                let a = if i >= bpp {
+                    output[output.len() - bpp]
+                } else {
+                    0
+                };
+                let b = if row_i > 0 {
+                    output[output.len() - stride]
+                } else {
+                    0
+                };
+                let c = if row_i > 0 && i >= bpp {
+                    output[output.len() - stride - bpp]
+                } else {
+                    0
+                };
+
+                let recon = match filter_type {
+                    0 => row[i],
+                    1 => row[i].wrapping_add(a),
+                    2 => row[i].wrapping_add(b),
+                    3 => row[i].wrapping_add(((a as u16 + b as u16) / 2) as u8),
+                    4 => row[i].wrapping_add(Self::paeth_predictor(a, b, c)),
+                    _ => unreachable!("invalid filter type, got {filter_type}"),
+                };
+                output.push(recon);
             }
-            FilterMethod::Sub => todo!(),
-            FilterMethod::Up => todo!(),
-            FilterMethod::Average => todo!(),
-            FilterMethod::Paeth => todo!(),
         }
+
         Ok(output)
+    }
+
+    fn get_bpp(header: &IHDRChunk) -> usize {
+        match header.color_type {
+            ColorType::Grayscale => match header.bit_depth {
+                BitDepth::B1 | BitDepth::B2 | BitDepth::B4 | BitDepth::B8 => 1,
+                BitDepth::B16 => 2,
+            },
+            ColorType::TrueColor => match header.bit_depth {
+                BitDepth::B8 => 3,
+                BitDepth::B16 => 6,
+                _ => unreachable!(),
+            },
+            ColorType::IndexedColor => match header.bit_depth {
+                // a pixel is a single palette-index sample, so bpp is always 1 byte
+                // (rounding up), regardless of how many bits that sample uses.
+                BitDepth::B1 | BitDepth::B2 | BitDepth::B4 | BitDepth::B8 => 1,
+                _ => unreachable!(),
+            },
+            ColorType::GrayScaleAlpha => match header.bit_depth {
+                BitDepth::B8 => 2,
+                BitDepth::B16 => 4,
+                _ => unreachable!(),
+            },
+            ColorType::TrueColorAlpha => match header.bit_depth {
+                BitDepth::B8 => 4,
+                BitDepth::B16 => 8,
+                _ => unreachable!(),
+            },
+        }
+    }
+
+    /// Unpacks `width` single-channel samples (grayscale intensities or
+    /// palette indices) from one scanline's worth of bytes, per `bit_depth`.
+    /// Rows are byte-aligned, so for bit depths < 8 the last byte of a row
+    /// may hold unused padding bits that must be dropped rather than read as
+    /// extra samples.
+    fn unpack_samples(row: &[u8], bit_depth: BitDepth, width: usize) -> Vec<u8> {
+        match bit_depth {
+            BitDepth::B8 => row[..width].to_vec(),
+            BitDepth::B1 | BitDepth::B2 | BitDepth::B4 => {
+                let bits = match bit_depth {
+                    BitDepth::B1 => 1,
+                    BitDepth::B2 => 2,
+                    BitDepth::B4 => 4,
+                    _ => unreachable!(),
+                };
+                let samples_per_byte = 8 / bits;
+                row.iter()
+                    .flat_map(|&byte| {
+                        (0..samples_per_byte)
+                            .map(move |i| (byte >> (8 - bits * (i + 1))) & ((1 << bits) - 1))
+                    })
+                    .take(width)
+                    .collect()
+            }
+            BitDepth::B16 => unreachable!("16-bit samples aren't bit-packed, nothing to unpack"),
+        }
+    }
+
+    /// Maximum sample value representable at `bit_depth` (i.e. `2^bits - 1`),
+    /// used as the PPM/PGM header's maxval for grayscale and true-color images.
+    fn max_sample_value(bit_depth: BitDepth) -> u32 {
+        match bit_depth {
+            BitDepth::B1 => 1,
+            BitDepth::B2 => 3,
+            BitDepth::B4 => 15,
+            BitDepth::B8 => 255,
+            BitDepth::B16 => 65535,
+        }
+    }
+
+    fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
+        let (a, b, c) = (a as i32, b as i32, c as i32);
+        let p = a + b - c;
+        let pa = (p - a).abs();
+        let pb = (p - b).abs();
+        let pc = (p - c).abs();
+        if pa <= pb && pa <= pc {
+            a as u8
+        } else if pb <= pc {
+            b as u8
+        } else {
+            c as u8
+        }
     }
 
     fn write_to_ppm(&self, filepath: &Path) -> std::io::Result<()> {
@@ -467,50 +560,15 @@ impl Png {
             ColorType::Grayscale => {
                 writeln!(file, "P2")?;
                 writeln!(file, "{} {}", self.header.width, self.header.height)?;
-                writeln!(
-                    file,
-                    "{}",
-                    match self.header.bit_depth {
-                        BitDepth::B1 => 1 << 1,
-                        BitDepth::B2 => 1 << 2,
-                        BitDepth::B4 => 1 << 4,
-                        BitDepth::B8 => 1 << 8,
-                        BitDepth::B16 => 1 << 16,
-                    } - 1
-                )?;
+                writeln!(file, "{}", Self::max_sample_value(self.header.bit_depth))?;
                 match self.header.bit_depth {
-                    BitDepth::B1 => {
-                        // dbg!("here", self.data.len());
-                        for byte in &self.data {
-                            writeln!(
-                                file,
-                                "{} {} {} {} {} {} {} {}",
-                                (byte >> 7) & 1,
-                                (byte >> 6) & 1,
-                                (byte >> 5) & 1,
-                                (byte >> 4) & 1,
-                                (byte >> 3) & 1,
-                                (byte >> 2) & 1,
-                                (byte >> 1) & 1,
-                                (byte >> 0) & 1
-                            )?;
-                        }
-                    }
-                    BitDepth::B2 => {
-                        for byte in &self.data {
-                            writeln!(
-                                file,
-                                "{} {} {} {}",
-                                (byte >> 6) & 0b11,
-                                (byte >> 4) & 0b11,
-                                (byte >> 2) & 0b11,
-                                (byte >> 0) & 0b11
-                            )?;
-                        }
-                    }
-                    BitDepth::B4 => {
-                        for byte in &self.data {
-                            writeln!(file, "{} {}", (byte >> 4) & 0b1111, (byte >> 0) & 0b1111)?
+                    BitDepth::B1 | BitDepth::B2 | BitDepth::B4 => {
+                        let width = self.header.width as usize;
+                        let stride = Self::scanline_length(&self.header) - 1;
+                        for row in self.data.chunks_exact(stride) {
+                            for sample in Self::unpack_samples(row, self.header.bit_depth, width) {
+                                writeln!(file, "{sample}")?;
+                            }
                         }
                     }
                     BitDepth::B8 => {
@@ -526,8 +584,47 @@ impl Png {
                     }
                 }
             }
-            ColorType::TrueColor => todo!(),
-            ColorType::IndexedColor => todo!(),
+            ColorType::TrueColor => {
+                writeln!(file, "P3")?;
+                writeln!(file, "{} {}", self.header.width, self.header.height)?;
+                writeln!(file, "{}", Self::max_sample_value(self.header.bit_depth))?;
+                match self.header.bit_depth {
+                    BitDepth::B8 => {
+                        for byte in self.data.chunks_exact(3) {
+                            writeln!(file, "{} {} {}", byte[0], byte[1], byte[2])?;
+                        }
+                    }
+                    BitDepth::B16 => {
+                        for byte in self.data.chunks_exact(6) {
+                            let v1 = (byte[0] as u16) << 8 | byte[1] as u16;
+                            let v2 = (byte[2] as u16) << 8 | byte[3] as u16;
+                            let v3 = (byte[4] as u16) << 8 | byte[5] as u16;
+                            writeln!(file, "{} {} {}", v1, v2, v3)?;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            ColorType::IndexedColor => {
+                let palette = &self
+                    .palette
+                    .as_ref()
+                    .expect("IndexedColor image must have a PLTE chunk")
+                    .palettes;
+
+                writeln!(file, "P3")?;
+                writeln!(file, "{} {}", self.header.width, self.header.height)?;
+                writeln!(file, "255")?;
+
+                let width = self.header.width as usize;
+                let stride = Self::scanline_length(&self.header) - 1;
+                for row in self.data.chunks_exact(stride) {
+                    for index in Self::unpack_samples(row, self.header.bit_depth, width) {
+                        let Palette { r, g, b } = palette[index as usize];
+                        writeln!(file, "{r} {g} {b}")?;
+                    }
+                }
+            }
             ColorType::GrayScaleAlpha => todo!(),
             ColorType::TrueColorAlpha => todo!(),
         }
@@ -557,7 +654,6 @@ fn main() -> std::io::Result<()> {
             if line.contains('g') { "pgm" } else { "ppm" }
         ));
         png.write_to_ppm(&output_path)?;
-        // return Ok(());
     }
 
     Ok(())

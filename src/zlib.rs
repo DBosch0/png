@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Format {
-    Raw,
+    // Raw,
     Zlib,
 }
 
@@ -44,9 +44,9 @@ impl<S: Sink> DecoderStream<'_, S> {
         self.ctx.inflate(buf, &mut self.sink, false)
     }
 
-    pub fn decompressed_size(&self) -> u64 {
-        self.sink.written()
-    }
+    // pub fn decompressed_size(&self) -> u64 {
+    //     self.sink.written()
+    // }
 
     pub fn finish(&mut self) -> Result<(u64, Option<u32>), Error> {
         if self.finished {
@@ -73,7 +73,9 @@ impl<S: Sink> Write for DecoderStream<'_, S> {
             Ok(_) => Ok(buf.len()),
             Err(err) => match err {
                 Error::Io(err) => Err(err),
-                Error::Underflow | Error::Overflow => {
+                Error::Underflow 
+                // | Error::Overflow 
+                => {
                     Err(io::Error::from(io::ErrorKind::InvalidInput))
                 }
                 _ => Err(io::Error::from(io::ErrorKind::InvalidData)),
@@ -863,7 +865,7 @@ pub trait Sink {
 pub enum Error {
     Underflow,
     InvalidBitStream,
-    Overflow,
+    // Overflow,
     Finished,
     Io(std::io::Error),
 }
@@ -1073,7 +1075,6 @@ impl Bits {
     }
 }
 
-const RING_BUFFER_SIZE: usize = 32768;
 const LITERAL_LENGTH_TREE_SIZE: usize = 1334;
 const DISTANCE_TREE_SIZE: usize = 402;
 const MAX_CODE_SIZE: usize = 15;
