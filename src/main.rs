@@ -76,6 +76,57 @@ impl BKGDChunk {
     }
 }
 
+/// Per-color-type transparency data. Grayscale/TrueColor mark a single exact
+/// sample value/triplet as fully transparent (everything else fully opaque);
+/// IndexedColor instead gives a per-palette-entry alpha, possibly shorter
+/// than PLTE (entries past the end default to fully opaque). Not valid for
+/// GrayScaleAlpha/TrueColorAlpha, which already carry a real alpha channel.
+#[derive(Debug, Clone, PartialEq)]
+enum TRNSChunk {
+    Gray(u16),
+    TrueColor { r: u16, g: u16, b: u16 },
+    Indexed(Vec<u8>),
+}
+
+impl TRNSChunk {
+    fn read_bytes<R: Read>(
+        read: &mut R,
+        length: usize,
+        color_type: ColorType,
+    ) -> std::io::Result<Self> {
+        match color_type {
+            ColorType::Grayscale => {
+                assert!(
+                    length == 2,
+                    "invalid tRNS chunk length for color_type {:?}",
+                    color_type
+                );
+                Ok(Self::Gray(read_u16(read)?))
+            }
+            ColorType::TrueColor => {
+                assert!(
+                    length == 6,
+                    "invalid tRNS chunk length for color_type {:?}",
+                    color_type
+                );
+                Ok(Self::TrueColor {
+                    r: read_u16(read)?,
+                    g: read_u16(read)?,
+                    b: read_u16(read)?,
+                })
+            }
+            ColorType::IndexedColor => {
+                let mut alphas = vec![0u8; length];
+                read.read_exact(&mut alphas)?;
+                Ok(Self::Indexed(alphas))
+            }
+            ColorType::GrayScaleAlpha | ColorType::TrueColorAlpha => {
+                unreachable!("tRNS chunk is not allowed for color_type {:?}", color_type)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SBITChunk {
     GrayScale(u8),
@@ -365,6 +416,7 @@ struct Png {
     gamma: Option<f64>,
     sbit: Option<SBITChunk>,
     bkgd: Option<BKGDChunk>,
+    trns: Option<TRNSChunk>,
     /// Fully reconstructed (unfiltered, deinterlaced, bit-unpacked) samples in
     /// row-major order, `raw_channels(header.color_type)` values per pixel.
     /// For IndexedColor this holds raw palette indices, not resolved RGB.
@@ -379,6 +431,7 @@ impl Debug for Png {
             .field("gamma", &self.gamma)
             .field("sbit", &self.sbit)
             .field("bkgd", &self.bkgd)
+            .field("trns", &self.trns)
             .finish()
     }
 }
@@ -404,6 +457,7 @@ impl Png {
         let mut gamma: Option<f64> = None;
         let mut sbit: Option<SBITChunk> = None;
         let mut bkgd: Option<BKGDChunk> = None;
+        let mut trns: Option<TRNSChunk> = None;
 
         loop {
             let (chunk_type, chunk_data) = read_chunk(read)?;
@@ -430,6 +484,17 @@ impl Png {
                     }
                     assert!(data.is_empty(), "bKGD chunk must precede IDAT data");
                     bkgd = Some(BKGDChunk::read_bytes(
+                        &mut chunk_data.as_slice(),
+                        chunk_data.len(),
+                        header.color_type,
+                    )?)
+                }
+                b"tRNS" => {
+                    if header.color_type == ColorType::IndexedColor {
+                        assert!(palette.is_some(), "PLTE chunk must precede tRNS chunk");
+                    }
+                    assert!(data.is_empty(), "tRNS chunk must precede IDAT data");
+                    trns = Some(TRNSChunk::read_bytes(
                         &mut chunk_data.as_slice(),
                         chunk_data.len(),
                         header.color_type,
@@ -479,6 +544,7 @@ impl Png {
             gamma,
             sbit,
             bkgd,
+            trns,
             samples,
         })
     }
@@ -693,16 +759,18 @@ impl Png {
         samples
     }
 
-    /// Number of channels/samples per pixel for this image's color type.
+    /// Number of channels/samples per pixel that `pixels()` emits.
     /// IndexedColor counts as 3 because `pixels` resolves each index through
-    /// the palette into an RGB triple.
+    /// the palette into an RGB triple. A tRNS chunk adds one synthesized
+    /// alpha channel for color types that don't already carry one.
     fn channels(&self) -> usize {
-        match self.header.color_type {
+        let base = match self.header.color_type {
             ColorType::Grayscale => 1,
             ColorType::GrayScaleAlpha => 2,
             ColorType::TrueColor | ColorType::IndexedColor => 3,
             ColorType::TrueColorAlpha => 4,
-        }
+        };
+        base + if self.trns.is_some() { 1 } else { 0 }
     }
 
     /// Unpacks `width` pixels' worth of channel samples (`channels` per
@@ -742,23 +810,63 @@ impl Png {
     /// Decodes this image into a flat, row-major array of pixel samples,
     /// `channels()` values per pixel, all widened to `u16` regardless of the
     /// source bit depth. IndexedColor samples are resolved through the
-    /// palette into RGB triples rather than left as raw indices.
+    /// palette into RGB triples rather than left as raw indices. A tRNS
+    /// chunk (Grayscale/TrueColor/IndexedColor only) appends a synthesized
+    /// alpha sample per pixel: fully transparent (0) for the one color/index
+    /// tRNS designates as transparent, fully opaque otherwise.
     fn pixels(&self) -> Vec<u16> {
-        if let ColorType::IndexedColor = self.header.color_type {
-            let palette = &self
-                .palette
-                .as_ref()
-                .expect("IndexedColor image must have a PLTE chunk")
-                .palettes;
-            self.samples
-                .iter()
-                .flat_map(|&index| {
-                    let Palette { r, g, b } = palette[index as usize];
-                    [r as u16, g as u16, b as u16]
-                })
-                .collect()
-        } else {
-            self.samples.clone()
+        let opaque = Self::max_sample_value(self.header.bit_depth);
+        match self.header.color_type {
+            ColorType::IndexedColor => {
+                let palette = &self
+                    .palette
+                    .as_ref()
+                    .expect("IndexedColor image must have a PLTE chunk")
+                    .palettes;
+                match &self.trns {
+                    Some(TRNSChunk::Indexed(alphas)) => self
+                        .samples
+                        .iter()
+                        .flat_map(|&index| {
+                            let Palette { r, g, b } = palette[index as usize];
+                            let a = alphas.get(index as usize).copied().unwrap_or(255) as u16;
+                            [r as u16, g as u16, b as u16, a]
+                        })
+                        .collect(),
+                    _ => self
+                        .samples
+                        .iter()
+                        .flat_map(|&index| {
+                            let Palette { r, g, b } = palette[index as usize];
+                            [r as u16, g as u16, b as u16]
+                        })
+                        .collect(),
+                }
+            }
+            ColorType::Grayscale => match &self.trns {
+                Some(TRNSChunk::Gray(transparent)) => self
+                    .samples
+                    .iter()
+                    .flat_map(|&v| [v, if v == *transparent { 0 } else { opaque }])
+                    .collect(),
+                _ => self.samples.clone(),
+            },
+            ColorType::TrueColor => match &self.trns {
+                Some(TRNSChunk::TrueColor { r, g, b }) => self
+                    .samples
+                    .chunks_exact(3)
+                    .flat_map(|px| {
+                        let a = if px[0] == *r && px[1] == *g && px[2] == *b {
+                            0
+                        } else {
+                            opaque
+                        };
+                        [px[0], px[1], px[2], a]
+                    })
+                    .collect(),
+                _ => self.samples.clone(),
+            },
+            ColorType::GrayScaleAlpha | ColorType::TrueColorAlpha => self.samples.clone(),
         }
     }
 
@@ -800,11 +908,20 @@ impl Png {
             ColorType::IndexedColor => 255,
             _ => Self::max_sample_value(self.header.bit_depth),
         };
-        let tuple_type = match self.header.color_type {
-            ColorType::Grayscale => "GRAYSCALE",
-            ColorType::GrayScaleAlpha => "GRAYSCALE_ALPHA",
-            ColorType::TrueColor | ColorType::IndexedColor => "RGB",
-            ColorType::TrueColorAlpha => "RGB_ALPHA",
+        let has_alpha = self.trns.is_some()
+            || matches!(
+                self.header.color_type,
+                ColorType::GrayScaleAlpha | ColorType::TrueColorAlpha
+            );
+        let tuple_type = match (self.header.color_type, has_alpha) {
+            (ColorType::Grayscale | ColorType::GrayScaleAlpha, false) => "GRAYSCALE",
+            (ColorType::Grayscale | ColorType::GrayScaleAlpha, true) => "GRAYSCALE_ALPHA",
+            (ColorType::TrueColor | ColorType::IndexedColor | ColorType::TrueColorAlpha, false) => {
+                "RGB"
+            }
+            (ColorType::TrueColor | ColorType::IndexedColor | ColorType::TrueColorAlpha, true) => {
+                "RGB_ALPHA"
+            }
         };
 
         writeln!(file, "P7")?;
